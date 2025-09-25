@@ -1,16 +1,35 @@
-from fastapi import FastAPI, Body, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Any
-from bs4 import BeautifulSoup
+"""
+AI Search Engine API - Core Application
+
+This module contains the main FastAPI application for the AI Search Engine.
+It provides semantic search capabilities using OpenAI embeddings and Pinecone vector database.
+
+Features:
+- Semantic search with OpenAI embeddings
+- AI-powered answers using GPT-4
+- Vector database integration with Pinecone
+- Content processing and HTML cleaning
+- External API integration
+
+Author: AI Search Engine Team
+Version: 1.0.0
+"""
+
+# Standard library imports
 import os
 import time
 import hashlib
+from typing import List, Any
+
+# Third-party imports
 import requests
-from pinecone import Pinecone, ServerlessSpec
-# Removed langchain dependencies to avoid version conflicts
-from openai import OpenAI
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from fastapi import FastAPI, Body, Query
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from pydantic import BaseModel
+from pinecone import Pinecone, ServerlessSpec
 
 # Load environment variables
 load_dotenv()
