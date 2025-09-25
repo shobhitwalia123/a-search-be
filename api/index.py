@@ -201,12 +201,8 @@ app = FastAPI(
     },
     servers=[
         {
-            "url": "http://localhost:8000",
-            "description": "Development server"
-        },
-        {
-            "url": "https://your-production-domain.com",
-            "description": "Production server"
+            "url": os.environ.get("API_BASE_URL", "http://localhost:8000"),
+            "description": "API Server"
         }
     ]
 )
