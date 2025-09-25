@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 from pinecone import Pinecone, ServerlessSpec
+from sentence_transformers import SentenceTransformer
 
 # Load environment variables
 load_dotenv()
@@ -39,14 +40,24 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "pclocal")
 PINECONE_HOST = os.environ.get("PINECONE_HOST", "http://localhost:5080")
 PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT", "us-east-1")
+USE_FREE_EMBEDDINGS = os.environ.get("USE_FREE_EMBEDDINGS", "true").lower() == "true"
 
-# Initialize OpenAI
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
+# Initialize embedding models
+client = None
+embedding_model = None
 
-# We'll use OpenAI client directly for embeddings
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+if USE_FREE_EMBEDDINGS:
+    # Use free Hugging Face model - no API key required!
+    print("🆓 Using FREE Hugging Face embeddings (no API costs)")
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # 384 dimensions, fast and free
+    EMBEDDING_DIMENSION = 384
+else:
+    # Use OpenAI (requires API key and costs money)
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable is required when USE_FREE_EMBEDDINGS=false")
+    print("💰 Using OpenAI embeddings (API costs apply)")
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    EMBEDDING_DIMENSION = 1536
 
 # Initialize Pinecone
 try:
@@ -78,13 +89,31 @@ def chunk_text_for_list(docs: List[str], max_chunk_size: int = 1000) -> List[Lis
 
     return [chunk_text(doc, max_chunk_size) for doc in docs]
 
-def generate_embeddings_batch(texts: List[str], batch_size: int = 5) -> List[List[float]]:
+def generate_embeddings_free(texts: List[str]) -> List[List[float]]:
     """
-    Generate embeddings for a list of texts in batches to reduce API calls.
+    Generate embeddings using free Hugging Face model - no API costs!
     
     Args:
         texts: List of text chunks to embed
-        batch_size: Number of texts to process in each API call (max 2048 for OpenAI)
+    
+    Returns:
+        List of embeddings for each text
+    """
+    print(f"🆓 Generating embeddings for {len(texts)} texts using FREE model...")
+    
+    # Process all texts at once - no rate limits with local model!
+    embeddings = embedding_model.encode(texts, convert_to_tensor=False, show_progress_bar=True)
+    
+    # Convert to list of lists
+    return [embedding.tolist() for embedding in embeddings]
+
+def generate_embeddings_openai_batch(texts: List[str], batch_size: int = 5) -> List[List[float]]:
+    """
+    Generate embeddings using OpenAI API with rate limiting (costs money).
+    
+    Args:
+        texts: List of text chunks to embed
+        batch_size: Number of texts to process in each API call
     
     Returns:
         List of embeddings for each text
@@ -98,14 +127,12 @@ def generate_embeddings_batch(texts: List[str], batch_size: int = 5) -> List[Lis
         
         for attempt in range(max_retries):
             try:
-                # Add delay between batch requests
-                if i > 0:  # Don't delay on first batch
-                    delay = 1.0 + random.uniform(0, 1)  # 1-2 second delay between batches
+                if i > 0:
+                    delay = 1.0 + random.uniform(0, 1)
                     print(f"Processing batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}, waiting {delay:.2f}s...")
                     time.sleep(delay)
                 
                 if attempt > 0:
-                    # Exponential backoff for retries
                     delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
                     print(f"Rate limit hit, waiting {delay:.2f} seconds before retry {attempt + 1}/{max_retries}")
                     time.sleep(delay)
@@ -115,22 +142,20 @@ def generate_embeddings_batch(texts: List[str], batch_size: int = 5) -> List[Lis
                     model="text-embedding-ada-002"
                 )
                 
-                # Extract embeddings from response
                 batch_embeddings = [item.embedding for item in response.data]
                 all_embeddings.extend(batch_embeddings)
-                break  # Success, exit retry loop
+                break
                 
             except Exception as e:
                 error_message = str(e).lower()
                 
-                if "rate limit" in error_message or "too many requests" in error_message:
+                if "rate limit" in error_message or "too many requests" in error_message or "insufficient_quota" in error_message:
                     if attempt < max_retries - 1:
-                        print(f"Rate limit error on batch attempt {attempt + 1}: {e}")
+                        print(f"OpenAI API error on attempt {attempt + 1}: {e}")
                         continue
                     else:
-                        print(f"Max retries reached for batch. Adding placeholder embeddings.")
-                        # Add placeholder embeddings for this batch
-                        placeholder_embeddings = [[0.0] * 1536 for _ in batch]
+                        print(f"Max retries reached. OpenAI quota exceeded - consider using free embeddings!")
+                        placeholder_embeddings = [[0.0] * EMBEDDING_DIMENSION for _ in batch]
                         all_embeddings.extend(placeholder_embeddings)
                         break
                 else:
@@ -141,13 +166,11 @@ def generate_embeddings_batch(texts: List[str], batch_size: int = 5) -> List[Lis
 
 def generate_embeddings(docs: List[Any]) -> List[List[float]]:
     """
-    Generate embeddings for a list of documents using batch processing for better rate limit handling.
+    Generate embeddings for a list of documents using either free or paid models.
     
-    This function includes:
-    - Batch processing to reduce API calls
-    - Rate limiting with delays between batches
-    - Exponential backoff retry logic for rate limit errors
-    - Better error handling for OpenAI API limits
+    This function automatically chooses between:
+    - FREE Hugging Face model (no API costs, runs locally)
+    - OpenAI API (costs money, requires quota)
     """
     result = []
     
@@ -155,9 +178,14 @@ def generate_embeddings(docs: List[Any]) -> List[List[float]]:
         if not doc:  # Skip empty documents
             result.append([])
             continue
+        
+        if USE_FREE_EMBEDDINGS:
+            # Use free Hugging Face model - no API limits!
+            doc_embeddings = generate_embeddings_free(doc)
+        else:
+            # Use OpenAI API with rate limiting
+            doc_embeddings = generate_embeddings_openai_batch(doc, batch_size=3)
             
-        # Use batch processing for better efficiency
-        doc_embeddings = generate_embeddings_batch(doc, batch_size=3)  # Small batch size for free tier
         result.append(doc_embeddings)
     
     return result
@@ -190,12 +218,18 @@ def upsert_data_to_pinecone(data_with_metadata: List[dict]) -> None:
     index.upsert(vectors=data_with_metadata)
 
 def get_query_embeddings(query: str) -> List[float]:
-    """Get embeddings for the given query string."""
-    response = client.embeddings.create(
-        input=query,
-        model="text-embedding-ada-002"
-    )
-    return response.data[0].embedding
+    """Get embeddings for the given query string using the configured model."""
+    if USE_FREE_EMBEDDINGS:
+        # Use free Hugging Face model
+        embedding = embedding_model.encode([query], convert_to_tensor=False)[0]
+        return embedding.tolist()
+    else:
+        # Use OpenAI API
+        response = client.embeddings.create(
+            input=query,
+            model="text-embedding-ada-002"
+        )
+        return response.data[0].embedding
 
 def query_pinecone_index(query_embeddings: List[float], top_k: int = 2) -> dict:
     """Query the Pinecone index for nearest neighbors."""
@@ -334,7 +368,7 @@ def create_pinecone_index(index_name: str):
     Create a Pinecone index with the specified name.
     
     - **index_name**: Name of the index to create
-    - **dimension**: Fixed at 1536 (OpenAI embedding dimension)
+    - **dimension**: Automatically matches embedding model (384 for free, 1536 for OpenAI)
     - **metric**: Cosine similarity
     - **spec**: AWS serverless specification
     
@@ -351,10 +385,14 @@ def create_pinecone_index(index_name: str):
             "error": f"Index '{index_name}' already exists. "
                      f"Use the load-index endpoint or choose a different name."
         }
-    # Create the index
+    
+    embedding_info = "FREE Hugging Face (384 dim)" if USE_FREE_EMBEDDINGS else "OpenAI (1536 dim)"
+    print(f"Creating index with {embedding_info} embeddings...")
+    
+    # Create the index with correct dimension
     pc.create_index(
         name=index_name,
-        dimension=1536,  # Must match embedding dimension
+        dimension=EMBEDDING_DIMENSION,  # Automatically matches the embedding model
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region=PINECONE_ENVIRONMENT)
     )
@@ -482,8 +520,8 @@ def search(search_request: SearchRequest):
         }
         results.append(result)
 
-    # Get LLM response for the first result
-    if results:
+    # Get LLM response for the first result (only if OpenAI is available)
+    if results and client is not None:
         text_answer = " ".join([doc["metadata"]["text"] for doc in answers["matches"]])
         prompt = f"{text_answer}\nOnly use the context provided. Do not use any prior information or training data. Now using the provided information only, give me a better and summarized answer to the query: '{query}'"
         
@@ -494,6 +532,10 @@ def search(search_request: SearchRequest):
             results[0]["title"] = f"AI Answer: {query}"
         except Exception as e:
             print(f"Error getting LLM response: {e}")
+            print("Continuing with regular search results...")
+    elif results and client is None:
+        print("🆓 Using FREE embeddings - AI answers disabled (no OpenAI API key)")
+        print("Search results available without AI-powered answers")
 
     return {
         "query": query,
