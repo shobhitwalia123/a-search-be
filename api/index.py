@@ -31,7 +31,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 from pinecone import Pinecone, ServerlessSpec
-from sentence_transformers import SentenceTransformer
 
 # Load environment variables
 load_dotenv()
@@ -42,15 +41,20 @@ PINECONE_HOST = os.environ.get("PINECONE_HOST", "http://localhost:5080")
 PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT", "us-east-1")
 USE_FREE_EMBEDDINGS = os.environ.get("USE_FREE_EMBEDDINGS", "true").lower() == "true"
 
+# Hugging Face API configuration (free)
+HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+HF_API_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN", "")  # Optional, can work without token
+
 # Initialize embedding models
 client = None
-embedding_model = None
+EMBEDDING_DIMENSION = 384  # Hugging Face model dimension
 
 if USE_FREE_EMBEDDINGS:
-    # Use free Hugging Face model - no API key required!
-    print("🆓 Using FREE Hugging Face embeddings (no API costs)")
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # 384 dimensions, fast and free
-    EMBEDDING_DIMENSION = 384
+    print("🆓 Using FREE Hugging Face Inference API (no local model loading)")
+    if HF_API_TOKEN:
+        print("Using authenticated Hugging Face API")
+    else:
+        print("Using free Hugging Face API (may have rate limits)")
 else:
     # Use OpenAI (requires API key and costs money)
     if not OPENAI_API_KEY:
@@ -89,9 +93,9 @@ def chunk_text_for_list(docs: List[str], max_chunk_size: int = 1000) -> List[Lis
 
     return [chunk_text(doc, max_chunk_size) for doc in docs]
 
-def generate_embeddings_free(texts: List[str]) -> List[List[float]]:
+def generate_embeddings_hf_api(texts: List[str]) -> List[List[float]]:
     """
-    Generate embeddings using free Hugging Face model - no API costs!
+    Generate embeddings using Hugging Face Inference API - no local model loading!
     
     Args:
         texts: List of text chunks to embed
@@ -99,13 +103,46 @@ def generate_embeddings_free(texts: List[str]) -> List[List[float]]:
     Returns:
         List of embeddings for each text
     """
-    print(f"🆓 Generating embeddings for {len(texts)} texts using FREE model...")
+    print(f"🆓 Generating embeddings for {len(texts)} texts using Hugging Face API...")
     
-    # Process all texts at once - no rate limits with local model!
-    embeddings = embedding_model.encode(texts, convert_to_tensor=False, show_progress_bar=True)
+    headers = {"Content-Type": "application/json"}
+    if HF_API_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
     
-    # Convert to list of lists
-    return [embedding.tolist() for embedding in embeddings]
+    all_embeddings = []
+    
+    # Process in small batches to avoid API limits
+    batch_size = 10
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        
+        try:
+            response = requests.post(
+                HF_API_URL,
+                headers=headers,
+                json={"inputs": batch, "options": {"wait_for_model": True}}
+            )
+            
+            if response.status_code == 200:
+                batch_embeddings = response.json()
+                all_embeddings.extend(batch_embeddings)
+                print(f"Processed batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
+                
+                # Small delay to respect API limits
+                time.sleep(0.5)
+            else:
+                print(f"Hugging Face API error: {response.status_code} - {response.text}")
+                # Fallback to zero embeddings
+                batch_embeddings = [[0.0] * EMBEDDING_DIMENSION for _ in batch]
+                all_embeddings.extend(batch_embeddings)
+                
+        except Exception as e:
+            print(f"Error calling Hugging Face API: {e}")
+            # Fallback to zero embeddings
+            batch_embeddings = [[0.0] * EMBEDDING_DIMENSION for _ in batch]
+            all_embeddings.extend(batch_embeddings)
+    
+    return all_embeddings
 
 def generate_embeddings_openai_batch(texts: List[str], batch_size: int = 5) -> List[List[float]]:
     """
@@ -180,8 +217,8 @@ def generate_embeddings(docs: List[Any]) -> List[List[float]]:
             continue
         
         if USE_FREE_EMBEDDINGS:
-            # Use free Hugging Face model - no API limits!
-            doc_embeddings = generate_embeddings_free(doc)
+            # Use free Hugging Face Inference API - no local model!
+            doc_embeddings = generate_embeddings_hf_api(doc)
         else:
             # Use OpenAI API with rate limiting
             doc_embeddings = generate_embeddings_openai_batch(doc, batch_size=3)
@@ -220,9 +257,9 @@ def upsert_data_to_pinecone(data_with_metadata: List[dict]) -> None:
 def get_query_embeddings(query: str) -> List[float]:
     """Get embeddings for the given query string using the configured model."""
     if USE_FREE_EMBEDDINGS:
-        # Use free Hugging Face model
-        embedding = embedding_model.encode([query], convert_to_tensor=False)[0]
-        return embedding.tolist()
+        # Use free Hugging Face Inference API
+        embeddings = generate_embeddings_hf_api([query])
+        return embeddings[0] if embeddings else [0.0] * EMBEDDING_DIMENSION
     else:
         # Use OpenAI API
         response = client.embeddings.create(
