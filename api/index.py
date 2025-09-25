@@ -307,91 +307,53 @@ def create_pinecone_index(index_name: str):
     "/upsert-data",
     tags=["Data Operations"],
     summary="Ingest and index documents",
-    description="Fetches content from external APIs, combines with provided documents, chunks the text, generates embeddings, and upserts to Pinecone index."
+    description="Processes provided documents, chunks the text, generates embeddings, and upserts to Pinecone index."
 )
-def upsert_data(
-    doc_list: DocumentList, 
-    extra_param: str = Query(None, description="Any optional extra parameter to pass?")
-):
+def upsert_data(doc_list: DocumentList):
     """
-    1) Call /getPageList to retrieve a list of pages.
-    2) For each page, call /getContent?pageId=<PAGE_ID> to get the content.
-    3) Combine fetched content with any user-provided doc_list.documents.
-    4) Chunk, embed, and upsert into Pinecone.
+    Process and index the provided documents.
+    
+    1) Clean HTML tags from documents
+    2) Chunk the documents into manageable pieces
+    3) Generate embeddings using OpenAI
+    4) Upsert to Pinecone index
+    
+    Args:
+        doc_list: List of documents to process and index
+        
+    Returns:
+        dict: Success message with upserted records count
     """
     global index
     if index is None:
         return {"error": "Index not created or not initialized. Call /create-index OR /load-index first."}
 
-    # 1) Call the getPageList endpoint
-    page_list_url = "https://fd10-2405-201-4018-1852-45e9-d3b8-df3b-f8ed.ngrok-free.app/getPageList"
-    try:
-        page_list_response = requests.get(page_list_url)
-        page_list_response.raise_for_status()  # Raise an exception if 4xx/5xx
-        page_list_json = page_list_response.json()
-    except Exception as e:
-        return {"error": f"Failed to call getPageList: {e}"}
+    if not doc_list.documents:
+        return {"error": "No documents provided in the request."}
 
-    if "results" not in page_list_json:
-        return {"error": "No 'results' field found in /getPageList response."}
+    # Clean HTML tags from documents
+    cleaned_documents = []
+    for doc in doc_list.documents:
+        cleaned_doc = remove_html_tags_bs4(doc)
+        cleaned_documents.append(cleaned_doc)
 
-    # 2) For each page in results, call getContent
-    #    We'll collect their content in a list
-    combined_documents = []
+    # Chunk the documents
+    chunked_docs = chunk_text_for_list(cleaned_documents)
 
-    for page_info in page_list_json["results"]:
-        page_id = page_info.get("id")
-        if not page_id:
-            # Skip this item if no ID
-            continue
-
-        # Build URL for second API call
-        get_content_url = f"https://fd10-2405-201-4018-1852-45e9-d3b8-df3b-f8ed.ngrok-free.app/getContent?pageId={page_id}"
-
-        # If you have an additional parameter to pass (extra_param), you could do:
-        # get_content_url += f"&extraParam={extra_param}"
-        # or handle logic differently if needed.
-
-        try:
-            content_response = requests.get(get_content_url)
-            content_response.raise_for_status()
-            content_json = content_response.json()
-            print(f"Processed Id : {page_id}")
-        except Exception as e:
-            # If one page fails, log/collect the error but continue
-            print(f"Error fetching pageId {page_id}: {e}")
-            continue
-
-        # Suppose content_json has a field "content" with the actual text
-        page_content = content_json.get("value")
-        if page_content:
-            # Append the retrieved content
-            combined_documents.append(remove_html_tags_bs4(page_content))
-        else:
-            # If the entire JSON is relevant, you could store the whole dict as a string
-            # combined_documents.append(str(content_json))
-            pass
-
-    # 3) Also append any user-provided docs from the request body
-    if doc_list.documents:
-        combined_documents.extend(doc_list.documents)
-
-    # 4) Now chunk the combined documents
-    chunked_docs = chunk_text_for_list(combined_documents)
-
-    # 5) Embed them
+    # Generate embeddings
     doc_embeddings = generate_embeddings(chunked_docs)
 
-    # 6) Convert to Pinecone's upsert format
-    data_with_meta_data = combine_vector_and_text(chunked_docs, doc_embeddings)
+    # Convert to Pinecone's upsert format
+    data_with_metadata = combine_vector_and_text(chunked_docs, doc_embeddings)
 
-    # 7) Upsert to Pinecone
-    upsert_data_to_pinecone(data_with_meta_data)
+    # Upsert to Pinecone
+    upsert_data_to_pinecone(data_with_metadata)
 
     return {
-        "message": "Documents chunked, embedded, and upserted successfully.",
-        "upserted_records_count": len(data_with_meta_data),
-        "additional_info": f"Called /getPageList, then /getContent for each pageId. extra_param={extra_param}"
+        "message": "Documents processed, chunked, embedded, and upserted successfully.",
+        "upserted_records_count": len(data_with_metadata),
+        "original_documents_count": len(doc_list.documents),
+        "total_chunks_created": len(data_with_metadata)
     }
 
 # 3) Search / Query - Updated to match frontend expectations
