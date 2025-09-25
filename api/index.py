@@ -43,7 +43,9 @@ USE_FREE_EMBEDDINGS = os.environ.get("USE_FREE_EMBEDDINGS", "true").lower() == "
 
 # Hugging Face API configuration (free)
 HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+HF_LLM_URL = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium"  # Free LLM for answers
 HF_API_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN", "")  # Optional, can work without token
+USE_FREE_LLM = os.environ.get("USE_FREE_LLM", "true").lower() == "true"  # Use free LLM instead of OpenAI
 
 # Initialize embedding models
 client = None
@@ -174,6 +176,81 @@ def create_simple_embedding(text: str) -> List[float]:
         embedding.append(0.0)
     
     return embedding[:EMBEDDING_DIMENSION]
+
+def generate_answer_free_llm(context: str, query: str) -> str:
+    """
+    Generate AI-powered answers using free Hugging Face LLM models.
+    
+    Args:
+        context: Retrieved context from Pinecone
+        query: User's search query
+    
+    Returns:
+        Generated answer string
+    """
+    print("🤖 Generating answer using FREE LLM...")
+    
+    # Create a prompt for the LLM
+    prompt = f"Context: {context}\n\nQuestion: {query}\n\nAnswer:"
+    
+    headers = {"Content-Type": "application/json"}
+    if HF_API_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
+    
+    try:
+        response = requests.post(
+            HF_LLM_URL,
+            headers=headers,
+            json={
+                "inputs": prompt,
+                "parameters": {
+                    "max_length": 200,
+                    "temperature": 0.7,
+                    "do_sample": True
+                }
+            },
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                generated_text = result[0].get("generated_text", "")
+                # Extract just the answer part
+                if "Answer:" in generated_text:
+                    answer = generated_text.split("Answer:")[-1].strip()
+                    return answer
+                return generated_text
+            return "Generated response successfully"
+        else:
+            print(f"LLM API error: {response.status_code} - {response.text}")
+            return create_simple_answer(context, query)
+            
+    except Exception as e:
+        print(f"Error calling free LLM: {e}")
+        return create_simple_answer(context, query)
+
+def create_simple_answer(context: str, query: str) -> str:
+    """
+    Create a simple answer when LLM fails.
+    This extracts relevant sentences from context.
+    """
+    sentences = context.split('. ')
+    relevant_sentences = []
+    
+    query_words = query.lower().split()
+    
+    for sentence in sentences:
+        sentence_lower = sentence.lower()
+        if any(word in sentence_lower for word in query_words):
+            relevant_sentences.append(sentence.strip())
+            if len(relevant_sentences) >= 2:  # Limit to 2 sentences
+                break
+    
+    if relevant_sentences:
+        return ". ".join(relevant_sentences) + "."
+    else:
+        return context[:200] + "..." if len(context) > 200 else context
 
 def generate_embeddings_openai_batch(texts: List[str], batch_size: int = 5) -> List[List[float]]:
     """
@@ -588,21 +665,33 @@ def search(search_request: SearchRequest):
         }
         results.append(result)
 
-    # Get LLM response for the first result (only if OpenAI is available)
-    if results and client is not None:
+    # Get LLM response for the first result (using free LLM or OpenAI)
+    if results and (client is not None or USE_FREE_LLM):
         text_answer = " ".join([doc["metadata"]["text"] for doc in answers["matches"]])
-        prompt = f"{text_answer}\nOnly use the context provided. Do not use any prior information or training data. Now using the provided information only, give me a better and summarized answer to the query: '{query}'"
         
         try:
-            final_answer = better_query_response(prompt)
+            if USE_FREE_LLM and USE_FREE_EMBEDDINGS:
+                # Use free LLM
+                final_answer = generate_answer_free_llm(text_answer, query)
+                print("✅ Used FREE LLM for answer generation")
+            elif client is not None:
+                # Use OpenAI
+                prompt = f"{text_answer}\nOnly use the context provided. Do not use any prior information or training data. Now using the provided information only, give me a better and summarized answer to the query: '{query}'"
+                final_answer = better_query_response(prompt)
+                print("✅ Used OpenAI for answer generation")
+            else:
+                final_answer = create_simple_answer(text_answer, query)
+                print("✅ Used simple answer extraction")
+            
             # Update the first result with the LLM response
             results[0]["description"] = final_answer
             results[0]["title"] = f"AI Answer: {query}"
+            
         except Exception as e:
             print(f"Error getting LLM response: {e}")
             print("Continuing with regular search results...")
-    elif results and client is None:
-        print("🆓 Using FREE embeddings - AI answers disabled (no OpenAI API key)")
+    elif results and client is None and not USE_FREE_LLM:
+        print("🆓 Using FREE embeddings - AI answers disabled")
         print("Search results available without AI-powered answers")
 
     return {
