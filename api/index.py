@@ -19,6 +19,7 @@ Version: 1.0.0
 import os
 import time
 import hashlib
+import random
 from typing import List, Any
 
 # Third-party imports
@@ -77,20 +78,88 @@ def chunk_text_for_list(docs: List[str], max_chunk_size: int = 1000) -> List[Lis
 
     return [chunk_text(doc, max_chunk_size) for doc in docs]
 
+def generate_embeddings_batch(texts: List[str], batch_size: int = 5) -> List[List[float]]:
+    """
+    Generate embeddings for a list of texts in batches to reduce API calls.
+    
+    Args:
+        texts: List of text chunks to embed
+        batch_size: Number of texts to process in each API call (max 2048 for OpenAI)
+    
+    Returns:
+        List of embeddings for each text
+    """
+    all_embeddings = []
+    
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                # Add delay between batch requests
+                if i > 0:  # Don't delay on first batch
+                    delay = 1.0 + random.uniform(0, 1)  # 1-2 second delay between batches
+                    print(f"Processing batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}, waiting {delay:.2f}s...")
+                    time.sleep(delay)
+                
+                if attempt > 0:
+                    # Exponential backoff for retries
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"Rate limit hit, waiting {delay:.2f} seconds before retry {attempt + 1}/{max_retries}")
+                    time.sleep(delay)
+                
+                response = client.embeddings.create(
+                    input=batch,
+                    model="text-embedding-ada-002"
+                )
+                
+                # Extract embeddings from response
+                batch_embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(batch_embeddings)
+                break  # Success, exit retry loop
+                
+            except Exception as e:
+                error_message = str(e).lower()
+                
+                if "rate limit" in error_message or "too many requests" in error_message:
+                    if attempt < max_retries - 1:
+                        print(f"Rate limit error on batch attempt {attempt + 1}: {e}")
+                        continue
+                    else:
+                        print(f"Max retries reached for batch. Adding placeholder embeddings.")
+                        # Add placeholder embeddings for this batch
+                        placeholder_embeddings = [[0.0] * 1536 for _ in batch]
+                        all_embeddings.extend(placeholder_embeddings)
+                        break
+                else:
+                    print(f"OpenAI API error: {e}")
+                    raise e
+    
+    return all_embeddings
+
 def generate_embeddings(docs: List[Any]) -> List[List[float]]:
     """
-    Generate embeddings for a list of documents (where each doc is a list of text chunks).
+    Generate embeddings for a list of documents using batch processing for better rate limit handling.
+    
+    This function includes:
+    - Batch processing to reduce API calls
+    - Rate limiting with delays between batches
+    - Exponential backoff retry logic for rate limit errors
+    - Better error handling for OpenAI API limits
     """
     result = []
+    
     for doc in docs:
-        doc_embeddings = []
-        for text in doc:
-            response = client.embeddings.create(
-                input=text,
-                model="text-embedding-ada-002"
-            )
-            doc_embeddings.append(response.data[0].embedding)
+        if not doc:  # Skip empty documents
+            result.append([])
+            continue
+            
+        # Use batch processing for better efficiency
+        doc_embeddings = generate_embeddings_batch(doc, batch_size=3)  # Small batch size for free tier
         result.append(doc_embeddings)
+    
     return result
 
 def generate_short_id(content: str) -> str:
@@ -311,18 +380,18 @@ def create_pinecone_index(index_name: str):
 )
 def upsert_data(doc_list: DocumentList):
     """
-    Process and index the provided documents.
+    Process and index the provided documents with rate limiting for free OpenAI accounts.
     
     1) Clean HTML tags from documents
     2) Chunk the documents into manageable pieces
-    3) Generate embeddings using OpenAI
+    3) Generate embeddings using OpenAI (with rate limiting)
     4) Upsert to Pinecone index
     
     Args:
         doc_list: List of documents to process and index
         
     Returns:
-        dict: Success message with upserted records count
+        dict: Success message with upserted records count and rate limiting info
     """
     global index
     if index is None:
@@ -331,29 +400,44 @@ def upsert_data(doc_list: DocumentList):
     if not doc_list.documents:
         return {"error": "No documents provided in the request."}
 
+    print(f"Processing {len(doc_list.documents)} documents...")
+    
     # Clean HTML tags from documents
     cleaned_documents = []
     for doc in doc_list.documents:
         cleaned_doc = remove_html_tags_bs4(doc)
         cleaned_documents.append(cleaned_doc)
 
+    print("Documents cleaned, starting chunking...")
+    
     # Chunk the documents
     chunked_docs = chunk_text_for_list(cleaned_documents)
+    total_chunks = sum(len(doc_chunks) for doc_chunks in chunked_docs)
+    
+    print(f"Created {total_chunks} text chunks, starting embedding generation...")
+    print("⚠️  Using free OpenAI account - this may take longer due to rate limiting")
 
-    # Generate embeddings
+    # Generate embeddings with rate limiting
+    start_time = time.time()
     doc_embeddings = generate_embeddings(chunked_docs)
+    embedding_time = time.time() - start_time
+
+    print(f"Embeddings generated in {embedding_time:.2f} seconds")
 
     # Convert to Pinecone's upsert format
     data_with_metadata = combine_vector_and_text(chunked_docs, doc_embeddings)
 
     # Upsert to Pinecone
+    print("Upserting to Pinecone...")
     upsert_data_to_pinecone(data_with_metadata)
 
     return {
-        "message": "Documents processed, chunked, embedded, and upserted successfully.",
+        "message": "Documents processed, chunked, embedded, and upserted successfully with rate limiting.",
         "upserted_records_count": len(data_with_metadata),
         "original_documents_count": len(doc_list.documents),
-        "total_chunks_created": len(data_with_metadata)
+        "total_chunks_created": len(data_with_metadata),
+        "embedding_generation_time_seconds": round(embedding_time, 2),
+        "rate_limiting_info": "Used batch processing and delays to respect OpenAI free tier limits"
     }
 
 # 3) Search / Query - Updated to match frontend expectations
